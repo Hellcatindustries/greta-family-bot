@@ -45,11 +45,15 @@ log = logging.getLogger("greta")
 
 # --- Configuration -----------------------------------------------------------
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_TOKEN = (
+    os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN") or ""
+).strip()
 if not TELEGRAM_TOKEN:
     raise SystemExit("Set TELEGRAM_TOKEN (or TELEGRAM_BOT_TOKEN) in the environment.")
 
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
+if not NOTION_TOKEN:
+    raise SystemExit("Set NOTION_TOKEN in the environment.")
 NOTION_VERSION = "2022-06-28"
 DEFAULT_LIST = os.environ.get("DEFAULT_LIST", "shopping").strip().lower()
 
