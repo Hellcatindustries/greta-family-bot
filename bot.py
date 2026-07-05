@@ -1,33 +1,43 @@
 """
 Greta — the Fosterlang Household Telegram bot.
 
-Message Greta on Telegram and she files it into the right list in your Notion hub
-("The Fosterlang Household"):
+Message Greta in plain English and she works out where it belongs and files it:
 
-    add milk                 -> Shopping List   (plain message, no command needed)
-    /shop oat milk           -> Shopping List
-    /todo take out the bins  -> To-Do List
-    /dream buy a boat        -> Dreams In Motion
-    /idea friday pizza       -> Ideas Hub
+    milk / dish soap ............... Shopping List (Notion)
+    call the plumber / pay rego .... To-Do List (Notion)
+    buy a boat / trip to Japan ..... Dreams In Motion (Notion)
+    friday pizza / redo garden ..... Ideas Hub (Notion)
+    hair appt Wed 12 July 11:30am .. Outlook calendar
 
-A plain message with no slash-command goes to your Shopping List. Leading words like
-"add", "buy", "get", "need", "grab" are stripped, so "add milk" stores just "milk".
+Routing is done by an AI classifier (Anthropic) when ANTHROPIC_API_KEY is set.
+Without it, Greta falls back to a simple rule (a time -> calendar, else Shopping).
+You can always force a section with a slash command: /shop /todo /dream /idea /cal
 
-Greta finds your four Notion databases automatically by their titles, so there are
-no database IDs to copy. You only need to connect the integration to the hub page once.
-
-Environment variables (set these in Railway):
-    TELEGRAM_TOKEN   (required)  from @BotFather   (TELEGRAM_BOT_TOKEN also accepted)
-    NOTION_TOKEN     (required)  internal integration secret (starts ntn_ or secret_)
-    ALLOWED_USER_ID  (optional)  comma-separated Telegram user IDs allowed to use Greta
-                                  (ALLOWED_USER_IDS also accepted)
-    DEFAULT_LIST     (optional)  shopping | todo | dream | idea   (default: shopping)
+Environment variables (set in Railway):
+    TELEGRAM_TOKEN     (required)  from @BotFather  (TELEGRAM_BOT_TOKEN also works)
+    NOTION_TOKEN       (required)  Notion internal integration secret (ntn_...)
+    ANTHROPIC_API_KEY  (optional)  enables smart routing to all sections
+    ALLOWED_USER_ID    (optional)  comma-separated Telegram user IDs allowed
+    CLASSIFIER_MODEL   (optional)  default: claude-haiku-4-5-20251001
+    # Outlook calendar (Microsoft Graph, client-credentials):
+    MS_CLIENT_ID, MS_CLIENT_SECRET, MS_TENANT_ID, MS_USER_EMAIL
+    TIMEZONE           (optional)  IANA tz for events (default: Australia/Sydney)
 """
 
 import os
+import re
+import json
 import logging
+from datetime import datetime, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 
 import httpx
+import dateparser
+from dateparser.search import search_dates
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -37,10 +47,7 @@ from telegram.ext import (
     filters,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("greta")
 
 # --- Configuration -----------------------------------------------------------
@@ -54,8 +61,12 @@ if not TELEGRAM_TOKEN:
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
 if not NOTION_TOKEN:
     raise SystemExit("Set NOTION_TOKEN in the environment.")
+
 NOTION_VERSION = "2022-06-28"
-DEFAULT_LIST = os.environ.get("DEFAULT_LIST", "shopping").strip().lower()
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+CLASSIFIER_MODEL = os.environ.get("CLASSIFIER_MODEL", "claude-haiku-4-5-20251001").strip()
+SMART = bool(ANTHROPIC_API_KEY)
 
 _allowed_raw = (
     os.environ.get("ALLOWED_USER_IDS") or os.environ.get("ALLOWED_USER_ID", "")
@@ -64,7 +75,13 @@ ALLOWED_USER_IDS = (
     {int(x) for x in _allowed_raw.replace(" ", "").split(",") if x} if _allowed_raw else None
 )
 
-# Friendly key -> the database TITLE exactly as it appears in your Notion hub.
+MS_CLIENT_ID = os.environ.get("MS_CLIENT_ID", "").strip()
+MS_CLIENT_SECRET = os.environ.get("MS_CLIENT_SECRET", "").strip()
+MS_TENANT_ID = os.environ.get("MS_TENANT_ID", "").strip()
+MS_USER_EMAIL = os.environ.get("MS_USER_EMAIL", "").strip()
+TIMEZONE = os.environ.get("TIMEZONE", "Australia/Sydney").strip()
+CALENDAR_ENABLED = all([MS_CLIENT_ID, MS_CLIENT_SECRET, MS_TENANT_ID, MS_USER_EMAIL])
+
 LIST_TITLES = {
     "shopping": "Shopping List",
     "todo": "To-Do List",
@@ -72,9 +89,11 @@ LIST_TITLES = {
     "idea": "Ideas Hub",
 }
 LIST_LABEL = dict(LIST_TITLES)
+SECTIONS = set(LIST_TITLES) | {"calendar"}
 
-# Words to trim off the front of a plain shopping message ("add milk" -> "milk").
 FILLER_PREFIXES = ("add ", "buy ", "get ", "grab ", "need ", "pick up ", "we need ")
+TIME_RE = re.compile(r"\b(\d{1,2}\s*:\s*\d{2}\s*(am|pm)?|\d{1,2}\s*(am|pm))\b", re.I)
+DURATION_RE = re.compile(r"for\s+(\d+)\s*(min|mins|minute|minutes|hour|hours|hr|hrs)", re.I)
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -82,55 +101,50 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
-# Filled in at startup: list key -> Notion database id
 _db_ids: dict[str, str] = {}
 
 
-# --- Notion helpers ----------------------------------------------------------
+def now_local() -> datetime:
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(TIMEZONE))
+        except Exception:  # pragma: no cover
+            pass
+    return datetime.now()
+
+
+# --- Notion ------------------------------------------------------------------
 
 async def resolve_databases() -> None:
-    """Look up each household database by title and cache its id."""
     async with httpx.AsyncClient(timeout=30) as client:
         for key, title in LIST_TITLES.items():
             try:
                 resp = await client.post(
                     "https://api.notion.com/v1/search",
                     headers=NOTION_HEADERS,
-                    json={
-                        "query": title,
-                        "filter": {"property": "object", "value": "database"},
-                    },
+                    json={"query": title, "filter": {"property": "object", "value": "database"}},
                 )
                 resp.raise_for_status()
             except httpx.HTTPError as exc:
                 log.error("Notion search failed for '%s': %s", title, exc)
                 continue
-
             for db in resp.json().get("results", []):
-                db_title = "".join(
-                    t.get("plain_text", "") for t in db.get("title", [])
-                ).strip()
+                db_title = "".join(t.get("plain_text", "") for t in db.get("title", [])).strip()
                 if db_title.lower() == title.lower():
                     _db_ids[key] = db["id"]
                     log.info("Resolved '%s' -> %s", title, db["id"])
                     break
             else:
-                log.warning(
-                    "Could NOT find a Notion database titled '%s'. "
-                    "Is the Greta integration connected to the hub page?",
-                    title,
-                )
+                log.warning("Could NOT find a Notion database titled '%s'.", title)
 
 
 async def add_to_list(key: str, text: str) -> bool:
-    """Create a new row (page) with `text` as its Name in the given list."""
     db_id = _db_ids.get(key)
     if not db_id:
-        await resolve_databases()  # maybe it was shared after startup
+        await resolve_databases()
         db_id = _db_ids.get(key)
     if not db_id:
         return False
-
     payload = {
         "parent": {"database_id": db_id},
         "properties": {"Name": {"title": [{"text": {"content": text}}]}},
@@ -145,7 +159,118 @@ async def add_to_list(key: str, text: str) -> bool:
     return True
 
 
-# --- Telegram helpers --------------------------------------------------------
+# --- Microsoft Graph (Outlook calendar) --------------------------------------
+
+async def graph_token() -> str:
+    url = f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "client_id": MS_CLIENT_ID,
+        "client_secret": MS_CLIENT_SECRET,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, data=data)
+        r.raise_for_status()
+        return r.json()["access_token"]
+
+
+async def create_event(subject, start_dt, end_dt):
+    try:
+        token = await graph_token()
+    except Exception as exc:  # noqa: BLE001
+        log.error("Graph token error: %s", exc)
+        return False, "couldn't sign in to Microsoft"
+    url = f"https://graph.microsoft.com/v1.0/users/{MS_USER_EMAIL}/events"
+    body = {
+        "subject": subject,
+        "start": {"dateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": TIMEZONE},
+        "end": {"dateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": TIMEZONE},
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body,
+        )
+    if r.status_code >= 300:
+        log.error("Graph create event failed (%s): %s", r.status_code, r.text)
+        if r.status_code in (401, 403):
+            return False, "the app needs Calendars.ReadWrite permission in Azure"
+        return False, "Microsoft rejected the event"
+    return True, "ok"
+
+
+def parse_event_from_text(text: str):
+    """Fallback date parser -> (subject, start_dt, end_dt) or None."""
+    dur_min = 60
+    m = DURATION_RE.search(text)
+    if m:
+        n = int(m.group(1))
+        dur_min = n * 60 if m.group(2).lower().startswith(("h", "hr")) else n
+    text_wo_dur = DURATION_RE.sub(" ", text)
+    found = search_dates(
+        text_wo_dur,
+        languages=["en"],
+        settings={"PREFER_DATES_FROM": "future", "RETURN_AS_TIMEZONE_AWARE": False},
+    )
+    if not found:
+        return None
+    phrase, start_dt = found[-1]
+    subject = strip_filler(text_wo_dur.replace(phrase, " "))
+    subject = re.sub(r"\b(on|at|the)\b", " ", subject, flags=re.I)
+    subject = re.sub(r"\s+", " ", subject).strip(" ,.-")
+    return (subject or "Appointment", start_dt, start_dt + timedelta(minutes=dur_min))
+
+
+# --- AI classifier -----------------------------------------------------------
+
+CLASSIFY_SYSTEM = (
+    "You are Greta, a family household assistant. Read the user's message and put it "
+    "in exactly ONE section, with a cleaned short title.\n\n"
+    "Sections:\n"
+    "- shopping: groceries/household items to buy (milk, dish soap, batteries)\n"
+    "- todo: tasks, chores, errands, reminders to do (call plumber, pay rego, mow lawn)\n"
+    "- dream: big long-term family goals/aspirations (buy a boat, trip to Japan, get married)\n"
+    "- idea: fun ideas or suggestions to consider (pizza night, redo the garden, weekend away)\n"
+    "- calendar: an appointment/event with a specific date and time (hair appt Wed 11:30am)\n\n"
+    'Return ONLY minified JSON: {"section":"shopping|todo|dream|idea|calendar",'
+    '"title":"short cleaned title","start":"YYYY-MM-DDTHH:MM or null",'
+    '"duration_min":integer or null}\n'
+    "Strip filler like 'add', 'remember to', 'we need to'. For calendar resolve the "
+    "date/time to local ISO and default duration to 60 unless stated. "
+    "Today is {today} ({tz})."
+)
+
+
+async def classify(text: str):
+    system = CLASSIFY_SYSTEM.format(today=now_local().strftime("%A %Y-%m-%d %H:%M"), tz=TIMEZONE)
+    body = {
+        "model": CLASSIFIER_MODEL,
+        "max_tokens": 200,
+        "system": system,
+        "messages": [{"role": "user", "content": text}],
+    }
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+            r.raise_for_status()
+            content = r.json()["content"][0]["text"]
+        match = re.search(r"\{.*\}", content, re.S)
+        data = json.loads(match.group(0)) if match else None
+        if data and data.get("section") in SECTIONS:
+            return data
+    except Exception as exc:  # noqa: BLE001
+        log.error("Classifier error: %s", exc)
+    return None
+
+
+# --- Helpers -----------------------------------------------------------------
 
 def authorized(update: Update) -> bool:
     if ALLOWED_USER_IDS is None:
@@ -162,63 +287,110 @@ def strip_filler(text: str) -> str:
     return text
 
 
-async def handle(update: Update, key: str, text: str) -> None:
-    if not authorized(update):
-        await update.message.reply_text("Sorry — you're not on Greta's guest list. 🙈")
-        return
+def fmt(dt) -> str:
+    return dt.strftime("%a %d %b, %I:%M %p").replace(" 0", " ")
 
+
+async def file_to_list(update: Update, key: str, text: str) -> None:
     text = (text or "").strip()
     if not text:
-        await update.message.reply_text(f"Give me something to add, e.g. /{key} milk")
+        await update.message.reply_text("Give me something to add, e.g. milk")
         return
-
     if await add_to_list(key, text):
         await update.message.reply_text(f"Added “{text}” to {LIST_LABEL[key]} ✅")
     else:
         await update.message.reply_text(
-            f"Couldn't reach {LIST_LABEL[key]} in Notion. "
-            "Check the Greta integration is connected to the hub page."
+            f"Couldn't reach {LIST_LABEL[key]} in Notion — check Greta is connected to the hub page."
         )
 
 
-# --- Command handlers --------------------------------------------------------
-
-async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle(update, "shopping", " ".join(context.args))
-
-
-async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle(update, "todo", " ".join(context.args))
-
-
-async def cmd_dream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle(update, "dream", " ".join(context.args))
+async def file_to_calendar(update: Update, subject, start_dt, end_dt) -> None:
+    ok, msg = await create_event(subject or "Appointment", start_dt, end_dt)
+    if ok:
+        end_txt = end_dt.strftime("%I:%M %p").lstrip("0")
+        await update.message.reply_text(
+            f"📅 Added “{subject}” to your Outlook calendar\n{fmt(start_dt)} – {end_txt}"
+        )
+    else:
+        await update.message.reply_text(f"Couldn't add that to the calendar — {msg}.")
 
 
-async def cmd_idea(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await handle(update, "idea", " ".join(context.args))
+async def route_calendar(update: Update, text, data=None) -> None:
+    if not CALENDAR_ENABLED:
+        # No calendar configured yet — keep it as a to-do so nothing is lost.
+        await file_to_list(update, "todo", (data or {}).get("title") or strip_filler(text))
+        return
+    start_dt = end_dt = subject = None
+    if data and data.get("start"):
+        try:
+            start_dt = datetime.fromisoformat(data["start"])
+        except Exception:  # noqa: BLE001
+            start_dt = dateparser.parse(data["start"])
+        if start_dt:
+            dur = int(data.get("duration_min") or 60)
+            end_dt = start_dt + timedelta(minutes=dur)
+            subject = data.get("title")
+    if start_dt is None:
+        parsed = parse_event_from_text(text)
+        if not parsed:
+            await update.message.reply_text(
+                "I couldn't work out the date/time. Try e.g. “hair appt Wed 12 July 11:30am for 30 min”."
+            )
+            return
+        subject, start_dt, end_dt = parsed
+    await file_to_calendar(update, subject, start_dt, end_dt)
+
+
+# --- Command handlers (explicit overrides) -----------------------------------
+
+async def cmd_shop(u, c):
+    if authorized(u): await file_to_list(u, "shopping", " ".join(c.args))
+async def cmd_todo(u, c):
+    if authorized(u): await file_to_list(u, "todo", " ".join(c.args))
+async def cmd_dream(u, c):
+    if authorized(u): await file_to_list(u, "dream", " ".join(c.args))
+async def cmd_idea(u, c):
+    if authorized(u): await file_to_list(u, "idea", " ".join(c.args))
+async def cmd_cal(u, c):
+    if authorized(u): await route_calendar(u, " ".join(c.args))
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
     await update.message.reply_text(
-        "Hi, I'm Greta 👋 I add things to your Fosterlang Household Notion.\n\n"
-        "Just message me and it goes to your Shopping List, e.g. “add milk”.\n\n"
-        "Or aim it at a specific list:\n"
-        "• /shop <item>  — Shopping List\n"
-        "• /todo <task>  — To-Do List\n"
-        "• /dream <goal> — Dreams In Motion\n"
-        "• /idea <idea>  — Ideas Hub"
+        "Hi, I'm Greta 👋 Just message me in plain English and I'll file it in the right place:\n\n"
+        "• “milk” → Shopping\n"
+        "• “call the plumber” → To-Do\n"
+        "• “trip to Japan” → Dreams\n"
+        "• “friday pizza night” → Ideas\n"
+        "• “hair appt Wed 12 July 11:30am for 30 min” → Calendar\n\n"
+        "Or force a section: /shop /todo /dream /idea /cal"
     )
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    key = DEFAULT_LIST if DEFAULT_LIST in LIST_TITLES else "shopping"
-    text = update.message.text
-    if key == "shopping":
-        text = strip_filler(text)
-    await handle(update, key, text)
+    if not authorized(update):
+        await update.message.reply_text("Sorry — you're not on Greta's guest list. 🙈")
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    data = await classify(text) if SMART else None
+    section = data.get("section") if data else None
+
+    if section is None:  # fallback heuristic
+        section = "calendar" if (CALENDAR_ENABLED and TIME_RE.search(text)) else "shopping"
+
+    if section == "calendar":
+        await route_calendar(update, text, data)
+        return
+
+    title = (data or {}).get("title") if data else None
+    if not title:
+        title = strip_filler(text) if section == "shopping" else text
+    await file_to_list(update, section, title)
 
 
 # --- Startup -----------------------------------------------------------------
@@ -226,22 +398,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(app: Application) -> None:
     log.info("Greta starting up — resolving Notion databases…")
     await resolve_databases()
+    log.info("Smart routing: %s | Calendar: %s", SMART, CALENDAR_ENABLED)
 
 
 def main() -> None:
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler(["shop", "shopping"], cmd_shop))
     app.add_handler(CommandHandler("todo", cmd_todo))
     app.add_handler(CommandHandler("dream", cmd_dream))
     app.add_handler(CommandHandler("idea", cmd_idea))
+    app.add_handler(CommandHandler(["cal", "appt", "event", "calendar"], cmd_cal))
     app.add_handler(CommandHandler(["help", "start"], cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
     log.info("Greta is listening for messages.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
