@@ -234,9 +234,9 @@ CLASSIFY_SYSTEM = (
     "- dream: big long-term family goals/aspirations (buy a boat, trip to Japan, get married)\n"
     "- idea: fun ideas or suggestions to consider (pizza night, redo the garden, weekend away)\n"
     "- calendar: an appointment/event with a specific date and time (hair appt Wed 11:30am)\n\n"
-    'Return ONLY minified JSON: {"section":"shopping|todo|dream|idea|calendar",'
+    'Return ONLY minified JSON: {{"section":"shopping|todo|dream|idea|calendar",'
     '"title":"short cleaned title","start":"YYYY-MM-DDTHH:MM or null",'
-    '"duration_min":integer or null}\n'
+    '"duration_min":integer or null}}\n'
     "Strip filler like 'add', 'remember to', 'we need to'. For calendar resolve the "
     "date/time to local ISO and default duration to 60 unless stated. "
     "Today is {today} ({tz})."
